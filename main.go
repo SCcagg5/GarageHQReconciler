@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,11 +22,13 @@ import (
 
 type Config struct {
 	ServiceDNS          string
-	AdminPort           string
+	GarageBin           string
 	RPCPort             string
+	AdminPort           string
+	RPCSecret           string
 	AdminToken          string
 	ExpectedNodes       int
-	CapacityBytes       int64
+	LayoutCapacity      string
 	ZonePrefix          string
 	TagPrefix           string
 	BucketName          string
@@ -32,19 +36,17 @@ type Config struct {
 	SecretKey           string
 	Interval            time.Duration
 	RequestTimeout      time.Duration
-	OfflineGrace        time.Duration
 	CreateBucket        bool
 	ImportKey           bool
 	ReplaceOfflineNodes bool
-	RepairOnChange      bool
 	DryRun              bool
 }
 
 type Node struct {
-	ID       string
-	IP       string
-	Endpoint string
-	Peer     string
+	FullID string
+	Short  string
+	IP     string
+	Peer   string
 }
 
 type APIClient struct {
@@ -52,6 +54,10 @@ type APIClient struct {
 	token string
 	hc    *http.Client
 }
+
+var fullIDRe = regexp.MustCompile(`(?i)\b[0-9a-f]{64}\b`)
+var shortIDRe = regexp.MustCompile(`(?i)\b[0-9a-f]{16}\b`)
+var versionRe = regexp.MustCompile(`(?m)Current cluster layout version:\s*(\d+)`)
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -64,7 +70,7 @@ func main() {
 	log.Printf("garage-reconciler starting: dns=%s expected_nodes=%d interval=%s dry_run=%v", cfg.ServiceDNS, cfg.ExpectedNodes, cfg.Interval, cfg.DryRun)
 
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), maxDuration(2*cfg.RequestTimeout, 30*time.Second))
+		ctx, cancel := context.WithTimeout(context.Background(), maxDuration(6*cfg.RequestTimeout, 60*time.Second))
 		err := reconcile(ctx, cfg)
 		cancel()
 		if err != nil {
@@ -85,126 +91,110 @@ func reconcile(ctx context.Context, cfg Config) error {
 
 	nodes := make([]Node, 0, len(ips))
 	for _, ip := range ips {
-		endpoint := endpointForIP(ip, cfg.AdminPort)
-		client := newClient(endpoint, cfg)
-		if err := client.health(ctx); err != nil {
-			log.Printf("garage admin not ready at %s: %v", endpoint, err)
-			continue
-		}
-		info, err := client.get(ctx, "/v2/GetNodeInfo/self")
+		fullID, err := garageNodeID(ctx, cfg, ip)
 		if err != nil {
-			log.Printf("cannot get self node info from %s: %v", endpoint, err)
+			log.Printf("node id not ready at %s:%s: %v", ip, cfg.RPCPort, err)
 			continue
 		}
-		id := firstNodeID(info)
-		if id == "" {
-			log.Printf("cannot extract node id from %s response", endpoint)
-			continue
-		}
-		n := Node{ID: id, IP: ip, Endpoint: endpoint, Peer: fmt.Sprintf("%s@%s:%s", id, ip, cfg.RPCPort)}
+		n := Node{FullID: fullID, Short: shortID(fullID), IP: ip, Peer: fmt.Sprintf("%s@%s:%s", fullID, ip, cfg.RPCPort)}
 		nodes = append(nodes, n)
 	}
-
 	nodes = uniqueNodes(nodes)
 	if len(nodes) == 0 {
-		return errors.New("no live garage nodes with readable admin API")
+		return errors.New("no live garage nodes reachable through RPC")
 	}
 	if len(nodes) < cfg.ExpectedNodes {
 		log.Printf("only %d/%d garage nodes visible; connect will run, layout apply will be skipped", len(nodes), cfg.ExpectedNodes)
 	}
 
-	// Make all visible nodes connect to all other visible nodes. Garage nodes do not discover Swarm peers by themselves.
-	peers := make([]string, 0, len(nodes))
+	// Garage does not auto-discover arbitrary Swarm peers. Build the peer spec as:
+	//   <full_node_id>@<task_ip>:3901
+	// and ask each visible node to connect to all other visible nodes.
 	for _, n := range nodes {
-		peers = append(peers, n.Peer)
-	}
-	for _, n := range nodes {
-		others := excludePeer(peers, n.Peer)
-		if len(others) == 0 {
-			continue
-		}
-		log.Printf("connect peers on %s: %s", n.Endpoint, strings.Join(others, ","))
-		if !cfg.DryRun {
-			if err := newClient(n.Endpoint, cfg).post(ctx, "/v2/ConnectClusterNodes", others, nil); err != nil {
-				log.Printf("ConnectClusterNodes on %s failed: %v", n.Endpoint, err)
+		for _, peer := range nodes {
+			if peer.FullID == n.FullID {
+				continue
+			}
+			if cfg.DryRun {
+				log.Printf("dry-run node connect on %s -> %s", n.IP, peer.Peer)
+				continue
+			}
+			if out, err := garageCLI(ctx, cfg, n.IP, "node", "connect", peer.Peer); err != nil {
+				log.Printf("node connect on %s -> %s warning: %v output=%s", n.IP, peer.Peer, err, trimOutput(out))
+			} else {
+				log.Printf("node connect on %s -> %s OK", n.IP, peer.Short)
 			}
 		}
 	}
 
-	primary := newClient(nodes[0].Endpoint, cfg)
-	status, err := primary.get(ctx, "/v2/GetClusterStatus")
-	if err != nil {
-		return fmt.Errorf("GetClusterStatus: %w", err)
-	}
-	layout, err := primary.get(ctx, "/v2/GetClusterLayout")
-	if err != nil {
-		return fmt.Errorf("GetClusterLayout: %w", err)
-	}
-
-	currentRoleIDs := extractRoleIDs(layout)
-	knownIDs := extractStatusNodeIDs(status)
-	if len(knownIDs) == 0 {
-		knownIDs = map[string]bool{}
-		for _, id := range idsFromNodes(nodes) {
-			knownIDs[id] = true
-		}
-	}
-	log.Printf("status: visible=%d known=%d role_ids=%d", len(nodes), len(knownIDs), len(currentRoleIDs))
-
+	primary := nodes[0]
 	if len(nodes) >= cfg.ExpectedNodes {
-		changed, err := reconcileLayout(ctx, cfg, primary, nodes, currentRoleIDs, layout)
+		changed, err := reconcileLayout(ctx, cfg, primary.IP, nodes)
 		if err != nil {
 			return err
 		}
-		if changed && cfg.RepairOnChange && !cfg.DryRun {
-			launchRepairs(ctx, cfg, primary, nodes)
+		if changed {
+			log.Printf("layout changed/applied; data repair will be handled by Garage background workers")
 		}
+	} else {
+		log.Printf("skip layout: only %d/%d nodes visible", len(nodes), cfg.ExpectedNodes)
 	}
 
 	if cfg.CreateBucket {
-		if err := ensureBucketAndKey(ctx, cfg, primary); err != nil {
+		adminEndpoint := endpointForIP(primary.IP, cfg.AdminPort)
+		client := newClient(adminEndpoint, cfg)
+		if err := ensureBucketAndKey(ctx, cfg, client); err != nil {
 			log.Printf("bucket/key reconcile warning: %v", err)
 		}
 	}
 
-	health, err := primary.get(ctx, "/v2/GetClusterHealth")
-	if err == nil {
-		log.Printf("health: %s", compactJSON(health))
+	if out, err := garageCLI(ctx, cfg, primary.IP, "status"); err == nil {
+		log.Printf("status:\n%s", strings.TrimSpace(out))
 	}
-
 	return nil
 }
 
-func reconcileLayout(ctx context.Context, cfg Config, c APIClient, nodes []Node, currentRoleIDs map[string]bool, layout any) (bool, error) {
-	active := idsFromNodes(nodes)
-	activeSet := map[string]bool{}
-	for _, id := range active {
-		activeSet[id] = true
+func reconcileLayout(ctx context.Context, cfg Config, primaryIP string, nodes []Node) (bool, error) {
+	layoutBefore, err := garageCLI(ctx, cfg, primaryIP, "layout", "show")
+	if err != nil {
+		return false, fmt.Errorf("layout show before: %w output=%s", err, trimOutput(layoutBefore))
 	}
 
-	roles := make([]map[string]any, 0)
+	roleIDs := parseLayoutRoleIDs(layoutBefore)
+	currentVersion := parseLayoutVersion(layoutBefore)
+	activeShorts := map[string]bool{}
+	for _, n := range nodes {
+		activeShorts[n.Short] = true
+	}
+
 	changed := false
 	for i, n := range nodes {
-		if currentRoleIDs[n.ID] {
+		if roleIDs[n.Short] {
 			continue
 		}
 		changed = true
-		roles = append(roles, map[string]any{
-			"id":       n.ID,
-			"zone":     fmt.Sprintf("%s%d", cfg.ZonePrefix, i+1),
-			"capacity": cfg.CapacityBytes,
-			"tags":     []string{fmt.Sprintf("%s%d", cfg.TagPrefix, i+1)},
-		})
+		zone := fmt.Sprintf("%s%d", cfg.ZonePrefix, i+1)
+		log.Printf("layout assign %s zone=%s capacity=%s", n.Short, zone, cfg.LayoutCapacity)
+		if !cfg.DryRun {
+			out, err := garageCLI(ctx, cfg, primaryIP, "layout", "assign", n.Short, "-z", zone, "-c", cfg.LayoutCapacity)
+			if err != nil {
+				return false, fmt.Errorf("layout assign %s: %w output=%s", n.Short, err, trimOutput(out))
+			}
+		}
 	}
 
-	// Optional unsafe removal. This is disabled by default. Enable only if Garage service replicas are stable and the admin token is trusted.
 	if cfg.ReplaceOfflineNodes {
-		for id := range currentRoleIDs {
-			if !activeSet[id] {
-				changed = true
-				// The Admin API v2 update schema accepts role changes. Official docs show assign examples;
-				// removal shape is not always documented in summaries, so we send the common explicit marker.
-				roles = append(roles, map[string]any{"id": id, "remove": true})
+		for id := range roleIDs {
+			if activeShorts[id] {
+				continue
+			}
+			changed = true
+			log.Printf("layout remove offline node %s", id)
+			if !cfg.DryRun {
+				out, err := garageCLI(ctx, cfg, primaryIP, "layout", "remove", id)
+				if err != nil {
+					log.Printf("layout remove %s warning: %v output=%s", id, err, trimOutput(out))
+				}
 			}
 		}
 	}
@@ -213,47 +203,67 @@ func reconcileLayout(ctx context.Context, cfg Config, c APIClient, nodes []Node,
 		log.Printf("layout already contains all visible nodes; no layout update needed")
 		return false, nil
 	}
-	if len(roles) == 0 {
-		return false, nil
-	}
-
-	body := map[string]any{"roles": roles}
-	log.Printf("UpdateClusterLayout: %s", compactJSON(body))
 	if cfg.DryRun {
 		return true, nil
 	}
-	if err := c.post(ctx, "/v2/UpdateClusterLayout", body, nil); err != nil {
-		return false, fmt.Errorf("UpdateClusterLayout: %w", err)
-	}
 
-	newLayout, err := c.get(ctx, "/v2/GetClusterLayout")
+	applyVersion := currentVersion + 1
+	if applyVersion <= 0 {
+		applyVersion = 1
+	}
+	log.Printf("layout apply --version %d", applyVersion)
+	out, err := garageCLI(ctx, cfg, primaryIP, "layout", "apply", "--version", strconv.FormatInt(applyVersion, 10))
 	if err != nil {
-		return false, fmt.Errorf("GetClusterLayout after update: %w", err)
-	}
-	version := nextLayoutVersion(layout, newLayout)
-	if version <= 0 {
-		return false, fmt.Errorf("could not infer next layout version from GetClusterLayout; refusing to apply")
-	}
-	applyBody := map[string]any{"version": version}
-	log.Printf("ApplyClusterLayout: %s", compactJSON(applyBody))
-	if err := c.post(ctx, "/v2/ApplyClusterLayout", applyBody, nil); err != nil {
-		return false, fmt.Errorf("ApplyClusterLayout: %w", err)
+		return false, fmt.Errorf("layout apply: %w output=%s", err, trimOutput(out))
 	}
 	return true, nil
 }
 
-func launchRepairs(ctx context.Context, cfg Config, c APIClient, nodes []Node) {
-	for _, n := range nodes {
-		for _, repairType := range []string{"tables", "blocks"} {
-			body := map[string]any{"repairType": repairType}
-			path := "/v2/LaunchRepairOperation/" + url.PathEscape(n.ID)
-			if err := c.post(ctx, path, body, nil); err != nil {
-				log.Printf("repair %s on %s warning: %v", repairType, n.ID, err)
-			} else {
-				log.Printf("repair %s launched on %s", repairType, n.ID)
-			}
-		}
+func garageNodeID(ctx context.Context, cfg Config, ip string) (string, error) {
+	out, err := garageCLI(ctx, cfg, ip, "node", "id")
+	if err != nil {
+		return "", fmt.Errorf("node id: %w output=%s", err, trimOutput(out))
 	}
+	m := fullIDRe.FindString(out)
+	if m == "" {
+		return "", fmt.Errorf("node id output did not contain a 64-hex node id: %s", trimOutput(out))
+	}
+	return strings.ToLower(m), nil
+}
+
+func garageCLI(ctx context.Context, cfg Config, ip string, args ...string) (string, error) {
+	cliArgs := []string{"-h", net.JoinHostPort(ip, cfg.RPCPort), "-s", cfg.RPCSecret}
+	cliArgs = append(cliArgs, args...)
+	cmd := exec.CommandContext(ctx, cfg.GarageBin, cliArgs...)
+	var b bytes.Buffer
+	cmd.Stdout = &b
+	cmd.Stderr = &b
+	err := cmd.Run()
+	return b.String(), err
+}
+
+func parseLayoutRoleIDs(s string) map[string]bool {
+	ids := map[string]bool{}
+	for _, m := range shortIDRe.FindAllString(s, -1) {
+		ids[strings.ToLower(m)] = true
+	}
+	return ids
+}
+
+func parseLayoutVersion(s string) int64 {
+	m := versionRe.FindStringSubmatch(s)
+	if len(m) != 2 {
+		return 0
+	}
+	n, _ := strconv.ParseInt(m[1], 10, 64)
+	return n
+}
+
+func shortID(full string) string {
+	if len(full) >= 16 {
+		return strings.ToLower(full[:16])
+	}
+	return strings.ToLower(full)
 }
 
 func ensureBucketAndKey(ctx context.Context, cfg Config, c APIClient) error {
@@ -265,47 +275,39 @@ func ensureBucketAndKey(ctx context.Context, cfg Config, c APIClient) error {
 			"accessKeyId": cfg.AccessKeyID,
 			"secretKey":   cfg.SecretKey,
 			"name":        "docker-registry",
+			"allow":       map[string]any{"createBucket": true},
 		}
 		if cfg.DryRun {
 			log.Printf("ImportKey dry-run: %s", cfg.AccessKeyID)
 		} else if err := c.post(ctx, "/v2/ImportKey", keyBody, nil); err != nil {
-			// Existing keys may return a conflict. This is intentionally non-fatal.
 			log.Printf("ImportKey warning for %s: %v", cfg.AccessKeyID, err)
+		} else {
+			log.Printf("key ensured: %s", cfg.AccessKeyID)
 		}
 	}
 
 	bucketBody := map[string]any{"globalAlias": cfg.BucketName}
-	if cfg.AccessKeyID != "" {
-		bucketBody["localAlias"] = map[string]any{
-			"accessKeyId": cfg.AccessKeyID,
-			"alias":       cfg.BucketName,
-			"allow": map[string]any{
-				"read": true, "write": true, "owner": true,
-			},
-		}
-	}
 	if cfg.DryRun {
 		log.Printf("CreateBucket dry-run: %s", cfg.BucketName)
 		return nil
 	}
 	if err := c.post(ctx, "/v2/CreateBucket", bucketBody, nil); err != nil {
 		log.Printf("CreateBucket warning for %s: %v", cfg.BucketName, err)
+	} else {
+		log.Printf("bucket ensured: %s", cfg.BucketName)
 	}
 
 	if cfg.AccessKeyID != "" {
-		info, err := c.getQuery(ctx, "/v2/GetBucketInfo", map[string]string{"globalAlias": cfg.BucketName})
-		if err == nil {
-			bucketID := firstStringByKeys(info, "id", "bucketId")
-			if bucketID != "" {
-				allowBody := map[string]any{
-					"bucketId":    bucketID,
-					"accessKeyId": cfg.AccessKeyID,
-					"permissions": map[string]any{"read": true, "write": true, "owner": true},
-				}
-				if err := c.post(ctx, "/v2/AllowBucketKey", allowBody, nil); err != nil {
-					log.Printf("AllowBucketKey warning: %v", err)
-				}
-			}
+		allowBody := map[string]any{
+			"bucketId":    cfg.BucketName,
+			"accessKeyId": cfg.AccessKeyID,
+			"permissions": map[string]any{"read": true, "write": true, "owner": true},
+		}
+		if err := c.post(ctx, "/v2/AllowBucketKey", allowBody, nil); err != nil {
+			// Some Garage versions require bucket UUID instead of alias here. Existing permission is also OK.
+			log.Printf("AllowBucketKey warning: %v", err)
+		} else {
+			log.Printf("bucket permissions ensured: bucket=%s key=%s", cfg.BucketName, cfg.AccessKeyID)
 		}
 	}
 	return nil
@@ -313,26 +315,6 @@ func ensureBucketAndKey(ctx context.Context, cfg Config, c APIClient) error {
 
 func newClient(base string, cfg Config) APIClient {
 	return APIClient{base: strings.TrimRight(base, "/"), token: cfg.AdminToken, hc: &http.Client{Timeout: cfg.RequestTimeout}}
-}
-
-func (c APIClient) health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/health", nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %s", resp.Status)
-	}
-	return nil
-}
-
-func (c APIClient) get(ctx context.Context, path string) (any, error) {
-	return c.getQuery(ctx, path, nil)
 }
 
 func (c APIClient) getQuery(ctx context.Context, path string, q map[string]string) (any, error) {
@@ -439,222 +421,65 @@ func endpointForIP(ip, port string) string {
 	return "http://" + ip + ":" + port
 }
 
-func firstNodeID(v any) string {
-	return firstStringByKeys(v, "nodeId", "nodeID", "id")
-}
-
-func firstStringByKeys(v any, keys ...string) string {
-	wanted := map[string]bool{}
-	for _, k := range keys {
-		wanted[strings.ToLower(k)] = true
-	}
-	var walk func(any) string
-	walk = func(x any) string {
-		switch t := x.(type) {
-		case map[string]any:
-			for k, val := range t {
-				if wanted[strings.ToLower(k)] {
-					if s, ok := val.(string); ok && looksLikeIDOrValue(s) {
-						return s
-					}
-				}
-			}
-			for _, val := range t {
-				if s := walk(val); s != "" {
-					return s
-				}
-			}
-		case []any:
-			for _, val := range t {
-				if s := walk(val); s != "" {
-					return s
-				}
-			}
-		}
-		return ""
-	}
-	return walk(v)
-}
-
-func looksLikeIDOrValue(s string) bool {
-	s = strings.TrimSpace(s)
-	return len(s) >= 4 && !strings.ContainsAny(s, " \n\t")
-}
-
-func extractStatusNodeIDs(v any) map[string]bool {
-	ids := map[string]bool{}
-	var walk func(any)
-	walk = func(x any) {
-		switch t := x.(type) {
-		case map[string]any:
-			id := ""
-			for _, key := range []string{"id", "nodeId", "nodeID"} {
-				if s, ok := t[key].(string); ok && len(s) >= 8 {
-					id = s
-					break
-				}
-			}
-			if id != "" {
-				ids[id] = true
-			}
-			for _, val := range t {
-				walk(val)
-			}
-		case []any:
-			for _, val := range t {
-				walk(val)
-			}
-		}
-	}
-	walk(v)
-	return ids
-}
-
-func extractRoleIDs(v any) map[string]bool {
-	ids := map[string]bool{}
-	var walk func(any, string)
-	walk = func(x any, parent string) {
-		switch t := x.(type) {
-		case map[string]any:
-			id := ""
-			for _, key := range []string{"id", "nodeId", "nodeID"} {
-				if s, ok := t[key].(string); ok && len(s) >= 8 {
-					id = s
-					break
-				}
-			}
-			_, hasZone := t["zone"]
-			_, hasCapacity := t["capacity"]
-			_, hasTags := t["tags"]
-			if id != "" && (hasZone || hasCapacity || hasTags || strings.Contains(strings.ToLower(parent), "role")) {
-				ids[id] = true
-			}
-			for k, val := range t {
-				walk(val, k)
-			}
-		case []any:
-			for _, val := range t {
-				walk(val, parent)
-			}
-		}
-	}
-	walk(v, "")
-	return ids
-}
-
-func nextLayoutVersion(oldLayout, newLayout any) int64 {
-	// Prefer a changed layout's highest version + 1 if possible; otherwise old highest + 1.
-	newMax := maxVersion(newLayout)
-	oldMax := maxVersion(oldLayout)
-	if newMax > 0 {
-		// Garage ApplyClusterLayout wants the new version. In normal flow this is current+1.
-		// If GetClusterLayout exposes staged/next version, maxVersion(newLayout) is usually that value.
-		if newMax > oldMax {
-			return newMax
-		}
-		return newMax + 1
-	}
-	if oldMax > 0 {
-		return oldMax + 1
-	}
-	return 0
-}
-
-func maxVersion(v any) int64 {
-	var max int64
-	var walk func(any, string)
-	walk = func(x any, key string) {
-		switch t := x.(type) {
-		case map[string]any:
-			for k, val := range t {
-				walk(val, k)
-			}
-		case []any:
-			for _, val := range t {
-				walk(val, key)
-			}
-		case float64:
-			if strings.Contains(strings.ToLower(key), "version") && int64(t) > max {
-				max = int64(t)
-			}
-		case int64:
-			if strings.Contains(strings.ToLower(key), "version") && t > max {
-				max = t
-			}
-		}
-	}
-	walk(v, "")
-	return max
-}
-
-func idsFromNodes(nodes []Node) []string {
-	out := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		out = append(out, n.ID)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func uniqueNodes(nodes []Node) []Node {
 	seen := map[string]bool{}
 	out := []Node{}
 	for _, n := range nodes {
-		if seen[n.ID] {
+		if seen[n.FullID] {
 			continue
 		}
-		seen[n.ID] = true
+		seen[n.FullID] = true
 		out = append(out, n)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	sort.Slice(out, func(i, j int) bool { return out[i].Short < out[j].Short })
 	return out
 }
 
-func excludePeer(peers []string, self string) []string {
-	out := []string{}
-	for _, p := range peers {
-		if p != self {
-			out = append(out, p)
-		}
+func trimOutput(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 800 {
+		return s[:800] + "..."
 	}
-	return out
-}
-
-func compactJSON(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Sprintf("%v", v)
-	}
-	if len(b) > 3000 {
-		return string(b[:3000]) + "..."
-	}
-	return string(b)
+	return s
 }
 
 func loadConfig() (Config, error) {
+	rpcSecret := env("GARAGE_RPC_SECRET", "")
+	if rpcSecret == "" {
+		p := env("GARAGE_RPC_SECRET_FILE", "/run/secrets/garage_rpc_secret")
+		if p != "" {
+			b, err := os.ReadFile(p)
+			if err == nil {
+				rpcSecret = strings.TrimSpace(string(b))
+			}
+		}
+	}
 	cfg := Config{
 		ServiceDNS:          env("GARAGE_SERVICE_DNS", "tasks.garage"),
-		AdminPort:           env("GARAGE_ADMIN_PORT", "3903"),
+		GarageBin:           env("GARAGE_BIN", "/garage"),
 		RPCPort:             env("GARAGE_RPC_PORT", "3901"),
+		AdminPort:           env("GARAGE_ADMIN_PORT", "3903"),
+		RPCSecret:           rpcSecret,
 		AdminToken:          env("GARAGE_ADMIN_TOKEN", ""),
 		ExpectedNodes:       envInt("GARAGE_EXPECTED_NODES", 2),
-		CapacityBytes:       envInt64("GARAGE_LAYOUT_CAPACITY_BYTES", 10_000_000_000),
-		ZonePrefix:          env("GARAGE_ZONE_PREFIX", "swarm-zone-"),
-		TagPrefix:           env("GARAGE_TAG_PREFIX", "garage-"),
+		LayoutCapacity:      env("GARAGE_LAYOUT_CAPACITY", "10G"),
+		ZonePrefix:          env("GARAGE_ZONE_PREFIX", "dc"),
+		TagPrefix:           env("GARAGE_TAG_PREFIX", "garage"),
 		BucketName:          env("GARAGE_BUCKET", "docker-registry"),
 		AccessKeyID:         env("GARAGE_S3_ACCESS_KEY_ID", ""),
 		SecretKey:           env("GARAGE_S3_SECRET_KEY", ""),
 		Interval:            envDuration("GARAGE_RECONCILE_INTERVAL", 30*time.Second),
-		RequestTimeout:      envDuration("GARAGE_REQUEST_TIMEOUT", 5*time.Second),
-		OfflineGrace:        envDuration("GARAGE_OFFLINE_GRACE", 5*time.Minute),
+		RequestTimeout:      envDuration("GARAGE_REQUEST_TIMEOUT", 10*time.Second),
 		CreateBucket:        envBool("GARAGE_CREATE_BUCKET", true),
 		ImportKey:           envBool("GARAGE_IMPORT_KEY", true),
 		ReplaceOfflineNodes: envBool("GARAGE_REPLACE_OFFLINE_NODES", true),
-		RepairOnChange:      envBool("GARAGE_REPAIR_ON_CHANGE", true),
 		DryRun:              envBool("GARAGE_DRY_RUN", false),
 	}
-	if cfg.AdminToken == "" {
-		return cfg, errors.New("GARAGE_ADMIN_TOKEN is required")
+	if cfg.RPCSecret == "" {
+		return cfg, errors.New("GARAGE_RPC_SECRET or GARAGE_RPC_SECRET_FILE is required")
+	}
+	if cfg.AdminToken == "" && cfg.CreateBucket {
+		return cfg, errors.New("GARAGE_ADMIN_TOKEN is required when GARAGE_CREATE_BUCKET=true")
 	}
 	if cfg.ExpectedNodes < 1 {
 		return cfg, errors.New("GARAGE_EXPECTED_NODES must be >= 1")
@@ -683,18 +508,6 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil {
-		return fallback
-	}
-	return n
-}
-
-func envInt64(key string, fallback int64) int64 {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
 		return fallback
 	}
