@@ -480,7 +480,7 @@ func getBucketIDByAlias(ctx context.Context, c APIClient, alias string) (string,
 
 func parseLayoutRoleIDs(s string) map[string]bool {
 	ids := map[string]bool{}
-	for _, m := range shortIDRe.FindAllString(s) {
+	for _, m := range shortIDRe.FindAllString(s, -1) {
 		ids[strings.ToLower(m)] = true
 	}
 	return ids
