@@ -220,15 +220,38 @@ func reconcileLayout(ctx context.Context, cfg Config, primaryIP string, nodes []
 }
 
 func garageNodeID(ctx context.Context, cfg Config, ip string) (string, error) {
-	out, err := garageCLI(ctx, cfg, ip, "node", "id")
-	if err != nil {
-		return "", fmt.Errorf("node id: %w output=%s", err, trimOutput(out))
+	// Do NOT use `garage node id` here. That command is local-only: it reads
+	// /etc/garage.toml and the local metadata directory of the container running
+	// the command. In this reconciler container, that would either fail or return
+	// the reconciler container identity, not the target Garage task identity.
+	//
+	// Instead, ask the target Garage Admin API for its own node information.
+	// This works before the cluster has a healthy layout, which is exactly the
+	// bootstrap state we need to handle.
+	client := newClient(endpointForIP(ip, cfg.AdminPort), cfg)
+	paths := []string{
+		"/v2/GetNodeInfo/self",
+		"/v2/GetClusterStatus",
 	}
-	m := fullIDRe.FindString(out)
-	if m == "" {
-		return "", fmt.Errorf("node id output did not contain a 64-hex node id: %s", trimOutput(out))
+	var errs []string
+	for _, path := range paths {
+		body, err := client.getRaw(ctx, path, nil)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", path, err))
+			continue
+		}
+		ids := fullIDRe.FindAllString(string(body), -1)
+		if len(ids) == 0 {
+			errs = append(errs, fmt.Sprintf("%s: no 64-hex node id in response: %s", path, trimOutput(string(body))))
+			continue
+		}
+		// GetNodeInfo/self should contain exactly the target task full ID.
+		// If a future Garage version includes more than one ID in this response,
+		// prefer the first one: it is still safer than `garage node id`, which is
+		// definitively local-only.
+		return strings.ToLower(ids[0]), nil
 	}
-	return strings.ToLower(m), nil
+	return "", fmt.Errorf("unable to get node id from admin API at %s:%s (%s)", ip, cfg.AdminPort, strings.Join(errs, "; "))
 }
 
 func garageCLI(ctx context.Context, cfg Config, ip string, args ...string) (string, error) {
@@ -315,6 +338,35 @@ func ensureBucketAndKey(ctx context.Context, cfg Config, c APIClient) error {
 
 func newClient(base string, cfg Config) APIClient {
 	return APIClient{base: strings.TrimRight(base, "/"), token: cfg.AdminToken, hc: &http.Client{Timeout: cfg.RequestTimeout}}
+}
+
+func (c APIClient) getRaw(ctx context.Context, path string, q map[string]string) ([]byte, error) {
+	u, err := url.Parse(c.base + path)
+	if err != nil {
+		return nil, err
+	}
+	if q != nil {
+		qq := u.Query()
+		for k, v := range q {
+			qq.Set(k, v)
+		}
+		u.RawQuery = qq.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.auth(req)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return b, nil
 }
 
 func (c APIClient) getQuery(ctx context.Context, path string, q map[string]string) (any, error) {
