@@ -326,47 +326,98 @@ func ensureBucketAndKey(ctx context.Context, cfg Config, c APIClient) error {
 	if cfg.BucketName == "" {
 		return nil
 	}
+
 	if cfg.ImportKey && cfg.AccessKeyID != "" && cfg.SecretKey != "" {
 		keyBody := map[string]any{
-			"accessKeyId": cfg.AccessKeyID,
-			"secretKey":   cfg.SecretKey,
-			"name":        "docker-registry",
-			"allow":       map[string]any{"createBucket": true},
+			"accessKeyId":     cfg.AccessKeyID,
+			"secretAccessKey": cfg.SecretKey,
+			"name":            "docker-registry",
 		}
 		if cfg.DryRun {
 			log.Printf("ImportKey dry-run: %s", cfg.AccessKeyID)
 		} else if err := c.post(ctx, "/v2/ImportKey", keyBody, nil); err != nil {
-			log.Printf("ImportKey warning for %s: %v", cfg.AccessKeyID, err)
+			// ImportKey is not idempotent if the key already exists. Treat an
+			// existing/readable key as success so the reconciler remains safe to run
+			// periodically.
+			if _, getErr := c.getQuery(ctx, "/v2/GetKeyInfo", map[string]string{"id": cfg.AccessKeyID}); getErr == nil {
+				log.Printf("key already exists: %s", cfg.AccessKeyID)
+			} else {
+				log.Printf("ImportKey warning for %s: %v", cfg.AccessKeyID, err)
+			}
 		} else {
 			log.Printf("key ensured: %s", cfg.AccessKeyID)
 		}
 	}
 
-	bucketBody := map[string]any{"globalAlias": cfg.BucketName}
 	if cfg.DryRun {
-		log.Printf("CreateBucket dry-run: %s", cfg.BucketName)
+		log.Printf("bucket/key dry-run: bucket=%s key=%s", cfg.BucketName, cfg.AccessKeyID)
 		return nil
 	}
-	if err := c.post(ctx, "/v2/CreateBucket", bucketBody, nil); err != nil {
-		log.Printf("CreateBucket warning for %s: %v", cfg.BucketName, err)
-	} else {
-		log.Printf("bucket ensured: %s", cfg.BucketName)
+
+	bucketID, err := ensureBucketID(ctx, cfg, c)
+	if err != nil {
+		return err
 	}
+	log.Printf("bucket ensured: %s id=%s", cfg.BucketName, bucketID)
 
 	if cfg.AccessKeyID != "" {
 		allowBody := map[string]any{
-			"bucketId":    cfg.BucketName,
+			"bucketId":    bucketID,
 			"accessKeyId": cfg.AccessKeyID,
 			"permissions": map[string]any{"read": true, "write": true, "owner": true},
 		}
 		if err := c.post(ctx, "/v2/AllowBucketKey", allowBody, nil); err != nil {
-			// Some Garage versions require bucket UUID instead of alias here. Existing permission is also OK.
 			log.Printf("AllowBucketKey warning: %v", err)
 		} else {
-			log.Printf("bucket permissions ensured: bucket=%s key=%s", cfg.BucketName, cfg.AccessKeyID)
+			log.Printf("bucket permissions ensured: bucket=%s id=%s key=%s", cfg.BucketName, bucketID, cfg.AccessKeyID)
 		}
 	}
 	return nil
+}
+
+func ensureBucketID(ctx context.Context, cfg Config, c APIClient) (string, error) {
+	if id, err := getBucketIDByAlias(ctx, c, cfg.BucketName); err == nil && id != "" {
+		return id, nil
+	}
+
+	bucketBody := map[string]any{"globalAlias": cfg.BucketName}
+	var created any
+	if err := c.post(ctx, "/v2/CreateBucket", bucketBody, &created); err != nil {
+		// CreateBucket is not idempotent if the global alias already exists. Retry
+		// GetBucketInfo before returning the error.
+		if id, getErr := getBucketIDByAlias(ctx, c, cfg.BucketName); getErr == nil && id != "" {
+			return id, nil
+		}
+		return "", fmt.Errorf("CreateBucket %s: %w", cfg.BucketName, err)
+	}
+	if id := extractStringField(created, "id"); id != "" {
+		return id, nil
+	}
+	if id, err := getBucketIDByAlias(ctx, c, cfg.BucketName); err == nil && id != "" {
+		return id, nil
+	}
+	return "", fmt.Errorf("CreateBucket %s succeeded but no bucket id was returned", cfg.BucketName)
+}
+
+func getBucketIDByAlias(ctx context.Context, c APIClient, alias string) (string, error) {
+	v, err := c.getQuery(ctx, "/v2/GetBucketInfo", map[string]string{"globalAlias": alias})
+	if err != nil {
+		return "", err
+	}
+	id := extractStringField(v, "id")
+	if id == "" {
+		return "", fmt.Errorf("GetBucketInfo %s returned no id", alias)
+	}
+	return id, nil
+}
+
+func extractStringField(v any, field string) string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := m[field].(string)
+	return s
 }
 
 func newClient(base string, cfg Config) APIClient {
