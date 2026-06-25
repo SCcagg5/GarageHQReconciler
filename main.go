@@ -119,17 +119,17 @@ func reconcile(ctx context.Context, cfg Config) error {
 				log.Printf("dry-run node connect on %s -> %s", n.IP, peer.Peer)
 				continue
 			}
-			if out, err := garageCLI(ctx, cfg, n.IP, "node", "connect", peer.Peer); err != nil {
-				log.Printf("node connect on %s -> %s warning: %v output=%s", n.IP, peer.Peer, err, trimOutput(out))
+			if out, err := garageCLI(ctx, cfg, n.Peer, "node", "connect", peer.Peer); err != nil {
+				log.Printf("node connect on %s -> %s warning: %v output=%s", n.Peer, peer.Peer, err, trimOutput(out))
 			} else {
-				log.Printf("node connect on %s -> %s OK", n.IP, peer.Short)
+				log.Printf("node connect on %s -> %s OK", n.Short, peer.Short)
 			}
 		}
 	}
 
 	primary := nodes[0]
 	if len(nodes) >= cfg.ExpectedNodes {
-		changed, err := reconcileLayout(ctx, cfg, primary.IP, nodes)
+		changed, err := reconcileLayout(ctx, cfg, primary.Peer, nodes)
 		if err != nil {
 			return err
 		}
@@ -148,14 +148,14 @@ func reconcile(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	if out, err := garageCLI(ctx, cfg, primary.IP, "status"); err == nil {
+	if out, err := garageCLI(ctx, cfg, primary.Peer, "status"); err == nil {
 		log.Printf("status:\n%s", strings.TrimSpace(out))
 	}
 	return nil
 }
 
-func reconcileLayout(ctx context.Context, cfg Config, primaryIP string, nodes []Node) (bool, error) {
-	layoutBefore, err := garageCLI(ctx, cfg, primaryIP, "layout", "show")
+func reconcileLayout(ctx context.Context, cfg Config, primaryPeer string, nodes []Node) (bool, error) {
+	layoutBefore, err := garageCLI(ctx, cfg, primaryPeer, "layout", "show")
 	if err != nil {
 		return false, fmt.Errorf("layout show before: %w output=%s", err, trimOutput(layoutBefore))
 	}
@@ -176,7 +176,7 @@ func reconcileLayout(ctx context.Context, cfg Config, primaryIP string, nodes []
 		zone := fmt.Sprintf("%s%d", cfg.ZonePrefix, i+1)
 		log.Printf("layout assign %s zone=%s capacity=%s", n.Short, zone, cfg.LayoutCapacity)
 		if !cfg.DryRun {
-			out, err := garageCLI(ctx, cfg, primaryIP, "layout", "assign", n.Short, "-z", zone, "-c", cfg.LayoutCapacity)
+			out, err := garageCLI(ctx, cfg, primaryPeer, "layout", "assign", n.Short, "-z", zone, "-c", cfg.LayoutCapacity)
 			if err != nil {
 				return false, fmt.Errorf("layout assign %s: %w output=%s", n.Short, err, trimOutput(out))
 			}
@@ -191,7 +191,7 @@ func reconcileLayout(ctx context.Context, cfg Config, primaryIP string, nodes []
 			changed = true
 			log.Printf("layout remove offline node %s", id)
 			if !cfg.DryRun {
-				out, err := garageCLI(ctx, cfg, primaryIP, "layout", "remove", id)
+				out, err := garageCLI(ctx, cfg, primaryPeer, "layout", "remove", id)
 				if err != nil {
 					log.Printf("layout remove %s warning: %v output=%s", id, err, trimOutput(out))
 				}
@@ -212,7 +212,7 @@ func reconcileLayout(ctx context.Context, cfg Config, primaryIP string, nodes []
 		applyVersion = 1
 	}
 	log.Printf("layout apply --version %d", applyVersion)
-	out, err := garageCLI(ctx, cfg, primaryIP, "layout", "apply", "--version", strconv.FormatInt(applyVersion, 10))
+	out, err := garageCLI(ctx, cfg, primaryPeer, "layout", "apply", "--version", strconv.FormatInt(applyVersion, 10))
 	if err != nil {
 		return false, fmt.Errorf("layout apply: %w output=%s", err, trimOutput(out))
 	}
@@ -254,15 +254,48 @@ func garageNodeID(ctx context.Context, cfg Config, ip string) (string, error) {
 	return "", fmt.Errorf("unable to get node id from admin API at %s:%s (%s)", ip, cfg.AdminPort, strings.Join(errs, "; "))
 }
 
-func garageCLI(ctx context.Context, cfg Config, ip string, args ...string) (string, error) {
-	cliArgs := []string{"-h", net.JoinHostPort(ip, cfg.RPCPort), "-s", cfg.RPCSecret}
+func garageCLI(ctx context.Context, cfg Config, remote string, args ...string) (string, error) {
+	// Garage CLI expects -h to be a full remote node identifier, not just host:port.
+	// Correct format: <full_node_id>@<ip_or_hostname>:<port>.
+	// Passing only 172.x.x.x:3901 fails with: Invalid RPC remote node identifier.
+	cliArgs := []string{"-h", remote, "-s", cfg.RPCSecret}
 	cliArgs = append(cliArgs, args...)
 	cmd := exec.CommandContext(ctx, cfg.GarageBin, cliArgs...)
+
+	// The reconciler itself may receive GARAGE_RPC_SECRET_FILE so it can read the
+	// Swarm/Compose secret. Do not leak that environment variable into the child
+	// Garage CLI process when we also pass -s/--rpc-secret. Garage correctly
+	// refuses configurations where both rpc_secret and rpc_secret_file are set.
+	cmd.Env = cleanChildEnv(os.Environ(),
+		"GARAGE_RPC_SECRET",
+		"GARAGE_RPC_SECRET_FILE",
+		"GARAGE_CONFIG_FILE",
+	)
+
 	var b bytes.Buffer
 	cmd.Stdout = &b
 	cmd.Stderr = &b
 	err := cmd.Run()
 	return b.String(), err
+}
+
+func cleanChildEnv(env []string, dropKeys ...string) []string {
+	drop := make(map[string]bool, len(dropKeys))
+	for _, k := range dropKeys {
+		drop[k] = true
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if drop[key] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 func parseLayoutRoleIDs(s string) map[string]bool {
