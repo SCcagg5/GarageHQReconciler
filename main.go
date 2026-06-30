@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -37,14 +38,18 @@ type GarageConfig struct {
 	RPCSecret           SecretValue
 	AdminToken          SecretValue
 	ReplaceOfflineNodes bool
-	Nodes               []ConfiguredNode
+	Targets             []ConfiguredTarget
 	AccessKeys          []AccessKeyConfig
 	Buckets             []BucketConfig
 	DryRun              bool
 }
 
-type ConfiguredNode struct {
+type ConfiguredTarget struct {
+	Name           string
+	Discovery      string
 	Endpoint       string
+	Endpoints      []string
+	ExpectedCount  int
 	Zone           string
 	Capacity       string
 	GarageBin      string
@@ -87,7 +92,6 @@ type RawGarage struct {
 	RPCPort             *int    `toml:"rpc_port"`
 	Interval            *string `toml:"interval"`
 	Timeout             *string `toml:"timeout"`
-	ExpectedNodes       *int    `toml:"expected_nodes"`
 	ReplicationFactor   *int    `toml:"replication_factor"`
 	RPCSecret           *string `toml:"rpc_secret"`
 	RPCSecretEnv        *string `toml:"rpc_secret_env"`
@@ -96,25 +100,29 @@ type RawGarage struct {
 	AdminTokenEnv       *string `toml:"admin_token_env"`
 	AdminTokenFile      *string `toml:"admin_token_file"`
 	ReplaceOfflineNodes *bool   `toml:"replace_offline_nodes"`
-	Nodes               []RawNode
+	Targets             []RawTarget
 	AccessKeys          []RawAccessKey
 	Buckets             []RawBucket
 }
 
-type RawNode struct {
-	Endpoint       *string `toml:"endpoint"`
-	Zone           *string `toml:"zone"`
-	Capacity       *string `toml:"capacity"`
-	GarageBin      *string `toml:"garage_bin"`
-	AdminPort      *int    `toml:"admin_port"`
-	RPCPort        *int    `toml:"rpc_port"`
-	Timeout        *string `toml:"timeout"`
-	RPCSecret      *string `toml:"rpc_secret"`
-	RPCSecretEnv   *string `toml:"rpc_secret_env"`
-	RPCSecretFile  *string `toml:"rpc_secret_file"`
-	AdminToken     *string `toml:"admin_token"`
-	AdminTokenEnv  *string `toml:"admin_token_env"`
-	AdminTokenFile *string `toml:"admin_token_file"`
+type RawTarget struct {
+	Name           *string  `toml:"name"`
+	Discovery      *string  `toml:"discovery"`
+	Endpoint       *string  `toml:"endpoint"`
+	Endpoints      []string `toml:"endpoints"`
+	ExpectedCount  *int     `toml:"expected_count"`
+	Zone           *string  `toml:"zone"`
+	Capacity       *string  `toml:"capacity"`
+	GarageBin      *string  `toml:"garage_bin"`
+	AdminPort      *int     `toml:"admin_port"`
+	RPCPort        *int     `toml:"rpc_port"`
+	Timeout        *string  `toml:"timeout"`
+	RPCSecret      *string  `toml:"rpc_secret"`
+	RPCSecretEnv   *string  `toml:"rpc_secret_env"`
+	RPCSecretFile  *string  `toml:"rpc_secret_file"`
+	AdminToken     *string  `toml:"admin_token"`
+	AdminTokenEnv  *string  `toml:"admin_token_env"`
+	AdminTokenFile *string  `toml:"admin_token_file"`
 }
 
 type RawAccessKey struct {
@@ -145,7 +153,7 @@ type Node struct {
 	Short  string
 	IP     string
 	Peer   string
-	Cfg    ConfiguredNode
+	Cfg    ConfiguredTarget
 }
 
 type APIClient struct {
@@ -184,7 +192,11 @@ var (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	cfg, err := loadRuntimeConfig()
+	configPath := flag.String("c", "", "path to reconciler TOML config file")
+	dryRunOverride := flag.String("dry-run", "", "override dry-run mode: true or false")
+	flag.Parse()
+
+	cfg, err := loadRuntimeConfig(*configPath, *dryRunOverride)
 	if cfg != nil {
 		printRuntimeConfig(*cfg)
 	}
@@ -234,8 +246,8 @@ func reconcileGarage(ctx context.Context, cfg GarageConfig, state *ReconcileStat
 		state.LastNodeSet = nodeSet
 	}
 
-	if len(nodes) < cfg.ExpectedNodes {
-		log.Printf("garage=%s only %d/%d garage nodes visible; layout apply skipped", cfg.Name, len(nodes), cfg.ExpectedNodes)
+	if len(nodes) != cfg.ExpectedNodes {
+		log.Printf("garage=%s visible garage node count does not match target topology: visible=%d target_nodes=%d; layout apply skipped", cfg.Name, len(nodes), cfg.ExpectedNodes)
 		if !state.KeyBucketEnsured && len(cfg.Buckets) > 0 {
 			client := newClient(endpointForIP(nodes[0].IP, nodes[0].Cfg.AdminPort), nodes[0].Cfg.AdminToken.Value, nodes[0].Cfg.RequestTimeout)
 			if err := ensureBucketsAndKeys(ctx, cfg, client); err != nil {
@@ -295,42 +307,14 @@ func reconcileGarage(ctx context.Context, cfg GarageConfig, state *ReconcileStat
 }
 
 func discoverLiveNodes(ctx context.Context, cfg GarageConfig) ([]Node, error) {
-	groups := map[string][]ConfiguredNode{}
-	order := []string{}
-	for _, nc := range cfg.Nodes {
-		if _, ok := groups[nc.Endpoint]; !ok {
-			order = append(order, nc.Endpoint)
-		}
-		groups[nc.Endpoint] = append(groups[nc.Endpoint], nc)
-	}
-
 	var nodes []Node
-	for _, endpoint := range order {
-		configured := groups[endpoint]
-		ips, err := resolveIPs(ctx, endpoint)
+	for _, nc := range cfg.Targets {
+		ips, err := resolveTargetIPs(ctx, cfg.Name, nc)
 		if err != nil {
 			return nil, err
 		}
-		if len(ips) == 0 {
-			log.Printf("garage=%s endpoint=%s resolved no IP", cfg.Name, endpoint)
-			continue
-		}
-
-		if len(configured) > 1 {
-			if len(ips) < len(configured) {
-				log.Printf("garage=%s endpoint=%s resolved only %d/%d IPs", cfg.Name, endpoint, len(ips), len(configured))
-			}
-			limit := minInt(len(ips), len(configured))
-			for i := 0; i < limit; i++ {
-				if n, ok := discoverOneNode(ctx, cfg, configured[i], ips[i]); ok {
-					nodes = append(nodes, n)
-				}
-			}
-			continue
-		}
-
 		for _, ip := range ips {
-			if n, ok := discoverOneNode(ctx, cfg, configured[0], ip); ok {
+			if n, ok := discoverOneNode(ctx, cfg, nc, ip); ok {
 				nodes = append(nodes, n)
 			}
 		}
@@ -339,7 +323,7 @@ func discoverLiveNodes(ctx context.Context, cfg GarageConfig) ([]Node, error) {
 	return uniqueNodes(nodes), nil
 }
 
-func discoverOneNode(ctx context.Context, garage GarageConfig, nc ConfiguredNode, ip string) (Node, bool) {
+func discoverOneNode(ctx context.Context, garage GarageConfig, nc ConfiguredTarget, ip string) (Node, bool) {
 	fullID, err := garageNodeIDV23(ctx, nc, ip)
 	if err != nil {
 		log.Printf("garage=%s node id not ready at %s:%d: %v", garage.Name, ip, nc.AdminPort, err)
@@ -429,7 +413,7 @@ func reconcileLayout(ctx context.Context, cfg GarageConfig, primary Node, nodes 
 	return true, nil
 }
 
-func garageNodeIDV23(ctx context.Context, nc ConfiguredNode, ip string) (string, error) {
+func garageNodeIDV23(ctx context.Context, nc ConfiguredTarget, ip string) (string, error) {
 	client := newClient(endpointForIP(ip, nc.AdminPort), nc.AdminToken.Value, nc.RequestTimeout)
 
 	body, err := client.getRaw(ctx, "/v2/GetClusterStatus", nil)
@@ -502,7 +486,7 @@ func findNodeIDForAddr(v any, ip string, port string) string {
 	return walk(v)
 }
 
-func garageCLI(ctx context.Context, nc ConfiguredNode, remote string, args ...string) (string, error) {
+func garageCLI(ctx context.Context, nc ConfiguredTarget, remote string, args ...string) (string, error) {
 	cliArgs := []string{"-h", remote, "-s", nc.RPCSecret.Value}
 	cliArgs = append(cliArgs, args...)
 
@@ -990,6 +974,53 @@ func decodeResponse(resp *http.Response) (any, error) {
 	return v, nil
 }
 
+func resolveTargetIPs(ctx context.Context, garageName string, target ConfiguredTarget) ([]string, error) {
+	switch target.Discovery {
+	case "static":
+		seen := map[string]bool{}
+		out := []string{}
+		for _, endpoint := range target.Endpoints {
+			ips, err := resolveIPs(ctx, endpoint)
+			if err != nil {
+				return nil, fmt.Errorf("garage=%s target=%s discovery=static endpoint=%s: %w", garageName, targetLabel(target), endpoint, err)
+			}
+			if len(ips) != 1 {
+				return nil, fmt.Errorf("garage=%s target=%s discovery=static endpoint=%s resolved %d IPs, expected exactly 1", garageName, targetLabel(target), endpoint, len(ips))
+			}
+			if !seen[ips[0]] {
+				seen[ips[0]] = true
+				out = append(out, ips[0])
+			}
+		}
+		if len(out) != target.ExpectedCount {
+			return nil, fmt.Errorf("garage=%s target=%s discovery=static expected_count=%d discovered_count=%d", garageName, targetLabel(target), target.ExpectedCount, len(out))
+		}
+		sort.Strings(out)
+		return out, nil
+	case "dns":
+		ips, err := resolveIPs(ctx, target.Endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("garage=%s target=%s discovery=dns endpoint=%s: %w", garageName, targetLabel(target), target.Endpoint, err)
+		}
+		if len(ips) != target.ExpectedCount {
+			return nil, fmt.Errorf("garage=%s target=%s discovery=dns endpoint=%s expected_count=%d discovered_count=%d resolved_ips=%s; refusing to reconcile layout", garageName, targetLabel(target), target.Endpoint, target.ExpectedCount, len(ips), strings.Join(ips, ","))
+		}
+		return ips, nil
+	default:
+		return nil, fmt.Errorf("garage=%s target=%s unsupported discovery=%q", garageName, targetLabel(target), target.Discovery)
+	}
+}
+
+func targetLabel(t ConfiguredTarget) string {
+	if t.Name != "" {
+		return t.Name
+	}
+	if t.Endpoint != "" {
+		return t.Endpoint
+	}
+	return strings.Join(t.Endpoints, ",")
+}
+
 func resolveIPs(ctx context.Context, names string) ([]string, error) {
 	parts := strings.Split(names, ",")
 
@@ -1001,6 +1032,7 @@ func resolveIPs(ctx context.Context, names string) ([]string, error) {
 		if name == "" {
 			continue
 		}
+		name = stripEndpointPort(name)
 
 		if ip := net.ParseIP(name); ip != nil {
 			s := ip.String()
@@ -1028,6 +1060,19 @@ func resolveIPs(ctx context.Context, names string) ([]string, error) {
 
 	sort.Strings(out)
 	return out, nil
+}
+
+func stripEndpointPort(endpoint string) string {
+	s := strings.TrimSpace(endpoint)
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		if u, err := url.Parse(s); err == nil && u.Host != "" {
+			s = u.Host
+		}
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	return strings.Trim(s, "[]")
 }
 
 func endpointForIP(ip string, port int) string {
@@ -1104,6 +1149,7 @@ func trimOutput(s string) string {
 type tomlScalar struct {
 	Kind string
 	S    string
+	SA   []string
 	I    int64
 	B    bool
 }
@@ -1243,8 +1289,6 @@ func assignRawGarageValue(g *RawGarage, key string, raw string, path string, lin
 		setString(&g.Interval)
 	case "timeout":
 		setString(&g.Timeout)
-	case "expected_nodes":
-		setInt(&g.ExpectedNodes)
 	case "replication_factor":
 		setInt(&g.ReplicationFactor)
 	case "rpc_secret":
@@ -1261,10 +1305,12 @@ func assignRawGarageValue(g *RawGarage, key string, raw string, path string, lin
 		setString(&g.AdminTokenFile)
 	case "replace_offline_nodes":
 		setBool(&g.ReplaceOfflineNodes)
+	case "targets":
+		targets, targetErrs := parseRawTargets(raw, path)
+		*errs = append(*errs, targetErrs...)
+		g.Targets = targets
 	case "nodes":
-		nodes, nodeErrs := parseRawNodes(raw, path)
-		*errs = append(*errs, nodeErrs...)
-		g.Nodes = nodes
+		*errs = append(*errs, fmt.Sprintf("line %d: %s is deprecated/unsupported; use targets = [...] with discovery = \"static\" or discovery = \"dns\"", lineNo, path))
 	case "access_keys":
 		accessKeys, accessKeyErrs := parseRawAccessKeys(raw, path)
 		*errs = append(*errs, accessKeyErrs...)
@@ -1278,16 +1324,24 @@ func assignRawGarageValue(g *RawGarage, key string, raw string, path string, lin
 	}
 }
 
-func parseRawNodes(raw string, path string) ([]RawNode, []string) {
+func parseRawTargets(raw string, path string) ([]RawTarget, []string) {
 	tables, errs := parseInlineTablesArray(raw, path)
-	out := make([]RawNode, 0, len(tables))
+	out := make([]RawTarget, 0, len(tables))
 	for i, tbl := range tables {
 		p := fmt.Sprintf("%s[%d]", path, i)
-		var n RawNode
+		var n RawTarget
 		for key, val := range tbl {
 			switch key {
+			case "name":
+				setScalarString(p+".name", val, &n.Name, &errs)
+			case "discovery":
+				setScalarString(p+".discovery", val, &n.Discovery, &errs)
 			case "endpoint":
 				setScalarString(p+".endpoint", val, &n.Endpoint, &errs)
+			case "endpoints":
+				setScalarStringArray(p+".endpoints", val, &n.Endpoints, &errs)
+			case "expected_count":
+				setScalarInt(p+".expected_count", val, &n.ExpectedCount, &errs)
 			case "zone":
 				setScalarString(p+".zone", val, &n.Zone, &errs)
 			case "capacity":
@@ -1396,6 +1450,14 @@ func setScalarString(path string, val tomlScalar, dst **string, errs *[]string) 
 	}
 	s := val.S
 	*dst = &s
+}
+
+func setScalarStringArray(path string, val tomlScalar, dst *[]string, errs *[]string) {
+	if val.Kind != "string_array" {
+		*errs = append(*errs, fmt.Sprintf("%s must be an array of strings", path))
+		return
+	}
+	*dst = append((*dst)[:0], val.SA...)
 }
 
 func setScalarInt(path string, val tomlScalar, dst **int, errs *[]string) {
@@ -1523,6 +1585,13 @@ func parseTOMLScalar(raw string) (tomlScalar, error) {
 	if s == "" {
 		return tomlScalar{}, errors.New("empty value")
 	}
+	if strings.HasPrefix(s, "[") {
+		arr, err := parseTOMLStringArray(s)
+		if err != nil {
+			return tomlScalar{}, err
+		}
+		return tomlScalar{Kind: "string_array", SA: arr}, nil
+	}
 	if strings.HasPrefix(s, "\"") {
 		if !strings.HasSuffix(s, "\"") || len(s) < 2 {
 			return tomlScalar{}, errors.New("unterminated string")
@@ -1549,10 +1618,39 @@ func parseTOMLScalar(raw string) (tomlScalar, error) {
 	return tomlScalar{Kind: "int", I: n}, nil
 }
 
+func parseTOMLStringArray(raw string) ([]string, error) {
+	s := strings.TrimSpace(raw)
+	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+		return nil, fmt.Errorf("unsupported scalar %q", raw)
+	}
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	if inner == "" {
+		return []string{}, nil
+	}
+	parts := splitTopLevelComma(inner)
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.HasPrefix(part, "\"") || !strings.HasSuffix(part, "\"") {
+			return nil, fmt.Errorf("array items must be strings: %q", part)
+		}
+		v, err := strconv.Unquote(part)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 func splitTopLevelComma(s string) []string {
 	var out []string
 	inString := false
 	escaped := false
+	bracketDepth := 0
 	start := 0
 	for i, r := range s {
 		if inString {
@@ -1569,19 +1667,25 @@ func splitTopLevelComma(s string) []string {
 			}
 			continue
 		}
-		if r == '"' {
+		switch r {
+		case '"':
 			inString = true
-			continue
-		}
-		if r == ',' {
-			out = append(out, s[start:i])
-			start = i + len(string(r))
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case ',':
+			if bracketDepth == 0 {
+				out = append(out, s[start:i])
+				start = i + len(string(r))
+			}
 		}
 	}
 	out = append(out, s[start:])
 	return out
 }
-
 func splitTOMLEqual(s string) (string, string, bool) {
 	inString := false
 	escaped := false
@@ -1685,22 +1789,39 @@ func isTOMLArraySeparator(r rune) bool {
 	return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == '\n'
 }
 
-func loadRuntimeConfig() (*RuntimeConfig, error) {
-	src := strings.TrimSpace(os.Getenv("GARAGE_RECONCILER_CONFIG_TOML"))
+func loadRuntimeConfig(configPath string, dryRunOverride string) (*RuntimeConfig, error) {
+	src, errs := loadConfigSource(configPath)
 	if src == "" {
-		return &RuntimeConfig{}, ValidationError([]string{"GARAGE_RECONCILER_CONFIG_TOML is required"})
+		errs = append(errs, "configuration is required: pass -c <path>, set GARAGE_RECONCILER_CONFIG_FILE, or set GARAGE_RECONCILER_CONFIG_TOML")
 	}
-	return loadTOMLRuntimeConfig(src)
+	return loadTOMLRuntimeConfig(src, dryRunOverride, errs)
 }
 
-func loadTOMLRuntimeConfig(src string) (*RuntimeConfig, error) {
-	raw, errs := parseRawConfigTOML(src)
+func loadConfigSource(configPath string) (string, []string) {
+	var errs []string
+	path := strings.TrimSpace(configPath)
+	if path == "" {
+		path = strings.TrimSpace(os.Getenv("GARAGE_RECONCILER_CONFIG_FILE"))
+	}
+	if path != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", []string{fmt.Sprintf("cannot read config file %s: %v", path, err)}
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return strings.TrimSpace(os.Getenv("GARAGE_RECONCILER_CONFIG_TOML")), errs
+}
 
-	dryRun, ok, err := parseStrictBoolEnv("GARAGE_RECONCILER_DRY_RUN")
+func loadTOMLRuntimeConfig(src string, dryRunOverride string, initialErrs []string) (*RuntimeConfig, error) {
+	raw, errs := parseRawConfigTOML(src)
+	errs = append(initialErrs, errs...)
+
+	dryRun, ok, err := parseStrictBoolSetting("GARAGE_RECONCILER_DRY_RUN", dryRunOverride)
 	if err != nil {
 		errs = append(errs, err.Error())
 	} else if !ok {
-		errs = append(errs, "GARAGE_RECONCILER_DRY_RUN is required and must be true or false")
+		errs = append(errs, "GARAGE_RECONCILER_DRY_RUN is required and must be true or false, unless -dry-run=true|false is passed")
 	}
 
 	cfg := RuntimeConfig{DryRun: dryRun}
@@ -1735,27 +1856,35 @@ func resolveGarage(path string, rg RawGarage, dryRun bool, errs *[]string) Garag
 	g.RPCPort = requiredPort(path+".rpc_port", rg.RPCPort, errs)
 	g.Interval = requiredDuration(path+".interval", rg.Interval, errs)
 	g.RequestTimeout = requiredDuration(path+".timeout", rg.Timeout, errs)
-	g.ExpectedNodes = requiredPositiveInt(path+".expected_nodes", rg.ExpectedNodes, errs)
 	g.ReplicationFactor = requiredPositiveInt(path+".replication_factor", rg.ReplicationFactor, errs)
 	g.RPCSecret = resolveSecret(path+".rpc_secret", rg.RPCSecret, rg.RPCSecretEnv, rg.RPCSecretFile, true, errs)
 	g.AdminToken = resolveSecret(path+".admin_token", rg.AdminToken, rg.AdminTokenEnv, rg.AdminTokenFile, true, errs)
 	g.ReplaceOfflineNodes = requiredBool(path+".replace_offline_nodes", rg.ReplaceOfflineNodes, errs)
 
-	if g.ExpectedNodes > 0 && g.ReplicationFactor > g.ExpectedNodes {
-		*errs = append(*errs, fmt.Sprintf("%s.replication_factor must be <= expected_nodes", path))
-	}
-	if len(rg.Nodes) == 0 {
-		*errs = append(*errs, fmt.Sprintf("%s.nodes must contain exactly expected_nodes entries", path))
-	} else if g.ExpectedNodes > 0 && len(rg.Nodes) != g.ExpectedNodes {
-		*errs = append(*errs, fmt.Sprintf("%s.nodes length must equal expected_nodes: got %d, want %d", path, len(rg.Nodes), g.ExpectedNodes))
+	if len(rg.Targets) == 0 {
+		*errs = append(*errs, fmt.Sprintf("%s.targets must contain at least one discovery target", path))
 	}
 	if len(rg.Buckets) == 0 {
 		*errs = append(*errs, fmt.Sprintf("%s.buckets must contain at least one bucket", path))
 	}
 
-	for i, rn := range rg.Nodes {
-		nodePath := fmt.Sprintf("%s.nodes[%d]", path, i)
-		g.Nodes = append(g.Nodes, resolveNode(nodePath, g, rn, errs))
+	declaredNodeCount := 0
+	seenEndpoints := map[string]int{}
+	for i, rn := range rg.Targets {
+		targetPath := fmt.Sprintf("%s.targets[%d]", path, i)
+		t := resolveTarget(targetPath, g, rn, errs)
+		g.Targets = append(g.Targets, t)
+		declaredNodeCount += t.ExpectedCount
+		if t.Discovery == "dns" && t.Endpoint != "" {
+			if _, exists := seenEndpoints[t.Endpoint]; exists {
+				*errs = append(*errs, fmt.Sprintf("%s.endpoint %q is duplicated; use one DNS target per homogeneous zone/capacity group", targetPath, t.Endpoint))
+			}
+			seenEndpoints[t.Endpoint] = i
+		}
+	}
+	g.ExpectedNodes = declaredNodeCount
+	if g.ExpectedNodes > 0 && g.ReplicationFactor > g.ExpectedNodes {
+		*errs = append(*errs, fmt.Sprintf("%s.replication_factor must be <= discovered topology size derived from targets: replication_factor=%d target_nodes=%d", path, g.ReplicationFactor, g.ExpectedNodes))
 	}
 
 	accessKeyByKey := map[string]AccessKeyConfig{}
@@ -1789,18 +1918,21 @@ func resolveGarage(path string, rg RawGarage, dryRun bool, errs *[]string) Garag
 		bucketNames[b.Name] = true
 	}
 
-	for i, n := range g.Nodes {
+	for i, n := range g.Targets {
 		if n.RPCSecret.Value != "" && g.RPCSecret.Value != "" && n.RPCSecret.Value != g.RPCSecret.Value {
-			*errs = append(*errs, fmt.Sprintf("%s.nodes[%d].rpc_secret differs from garage rpc_secret; Garage requires the same rpc_secret on all nodes in one cluster", path, i))
+			*errs = append(*errs, fmt.Sprintf("%s.targets[%d].rpc_secret differs from garage rpc_secret; Garage requires the same rpc_secret on all targets in one cluster", path, i))
 		}
 	}
 
 	return g
 }
 
-func resolveNode(path string, g GarageConfig, rn RawNode, errs *[]string) ConfiguredNode {
-	n := ConfiguredNode{}
-	n.Endpoint = requiredString(path+".endpoint", rn.Endpoint, errs)
+func resolveTarget(path string, g GarageConfig, rn RawTarget, errs *[]string) ConfiguredTarget {
+	n := ConfiguredTarget{}
+	n.Name = optionalString(rn.Name)
+	n.Discovery = requiredString(path+".discovery", rn.Discovery, errs)
+	n.Endpoint = optionalString(rn.Endpoint)
+	n.Endpoints = trimStringList(rn.Endpoints)
 	n.Zone = requiredString(path+".zone", rn.Zone, errs)
 	n.Capacity = requiredString(path+".capacity", rn.Capacity, errs)
 	n.GarageBin = inheritString(rn.GarageBin, g.GarageBin)
@@ -1830,6 +1962,36 @@ func resolveNode(path string, g GarageConfig, rn RawNode, errs *[]string) Config
 	if n.GarageBin == "" {
 		*errs = append(*errs, fmt.Sprintf("%s effective garage_bin is required", path))
 	}
+	switch n.Discovery {
+	case "static":
+		if n.Endpoint != "" {
+			*errs = append(*errs, fmt.Sprintf("%s.endpoint is not allowed with discovery=static; use endpoints=[...]", path))
+		}
+		if len(n.Endpoints) == 0 {
+			*errs = append(*errs, fmt.Sprintf("%s.endpoints must contain at least one endpoint when discovery=static", path))
+		}
+		if rn.ExpectedCount != nil {
+			n.ExpectedCount = optionalPositiveInt(path+".expected_count", rn.ExpectedCount, 0, errs)
+			if n.ExpectedCount != len(n.Endpoints) {
+				*errs = append(*errs, fmt.Sprintf("%s.expected_count must equal len(endpoints) when discovery=static: got %d, want %d", path, n.ExpectedCount, len(n.Endpoints)))
+			}
+		} else {
+			n.ExpectedCount = len(n.Endpoints)
+		}
+	case "dns":
+		if n.Endpoint == "" {
+			*errs = append(*errs, fmt.Sprintf("%s.endpoint is required when discovery=dns", path))
+		}
+		if len(n.Endpoints) > 0 {
+			*errs = append(*errs, fmt.Sprintf("%s.endpoints is not allowed with discovery=dns; use endpoint=...", path))
+		}
+		n.ExpectedCount = requiredPositiveInt(path+".expected_count", rn.ExpectedCount, errs)
+	default:
+		if n.Discovery != "" {
+			*errs = append(*errs, fmt.Sprintf("%s.discovery must be either \"static\" or \"dns\", got %q", path, n.Discovery))
+		}
+	}
+
 	return n
 }
 
@@ -1908,6 +2070,27 @@ func requiredString(path string, v *string, errs *[]string) string {
 	return s
 }
 
+func optionalString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return strings.TrimSpace(*v)
+}
+
+func trimStringList(in []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
 func requiredBool(path string, v *bool, errs *[]string) bool {
 	if v == nil {
 		*errs = append(*errs, fmt.Sprintf("%s is required", path))
@@ -1920,6 +2103,16 @@ func requiredPositiveInt(path string, v *int, errs *[]string) int {
 	if v == nil {
 		*errs = append(*errs, fmt.Sprintf("%s is required", path))
 		return 0
+	}
+	if *v <= 0 {
+		*errs = append(*errs, fmt.Sprintf("%s must be > 0", path))
+	}
+	return *v
+}
+
+func optionalPositiveInt(path string, v *int, defaultValue int, errs *[]string) int {
+	if v == nil {
+		return defaultValue
 	}
 	if *v <= 0 {
 		*errs = append(*errs, fmt.Sprintf("%s must be > 0", path))
@@ -2052,8 +2245,12 @@ func inheritInt(v *int, parent int) int {
 	return *v
 }
 
-func parseStrictBoolEnv(key string) (bool, bool, error) {
-	raw, exists := os.LookupEnv(key)
+func parseStrictBoolSetting(key string, override string) (bool, bool, error) {
+	raw := strings.TrimSpace(override)
+	exists := raw != ""
+	if !exists {
+		raw, exists = os.LookupEnv(key)
+	}
 	if !exists {
 		return false, false, nil
 	}
@@ -2074,11 +2271,11 @@ func printRuntimeConfig(cfg RuntimeConfig) {
 	for _, g := range cfg.Garages {
 		log.Printf("  [[garages]] name=%q", g.Name)
 		log.Printf("    garage_bin=%q admin_port=%d rpc_port=%d interval=%s timeout=%s", g.GarageBin, g.AdminPort, g.RPCPort, g.Interval, g.RequestTimeout)
-		log.Printf("    expected_nodes=%d replication_factor=%d replace_offline_nodes=%v", g.ExpectedNodes, g.ReplicationFactor, g.ReplaceOfflineNodes)
+		log.Printf("    target_nodes=%d replication_factor=%d replace_offline_nodes=%v", g.ExpectedNodes, g.ReplicationFactor, g.ReplaceOfflineNodes)
 		log.Printf("    rpc_secret=%s admin_token=%s", redactSecret(g.RPCSecret), redactSecret(g.AdminToken))
-		log.Printf("    nodes:")
-		for _, n := range g.Nodes {
-			log.Printf("      - endpoint=%q zone=%q capacity=%q garage_bin=%q admin_port=%d rpc_port=%d timeout=%s admin_token=%s rpc_secret=%s", n.Endpoint, n.Zone, n.Capacity, n.GarageBin, n.AdminPort, n.RPCPort, n.RequestTimeout, redactSecret(n.AdminToken), redactSecret(n.RPCSecret))
+		log.Printf("    targets:")
+		for _, n := range g.Targets {
+			log.Printf("      - name=%q discovery=%q endpoint=%q endpoints=%q expected_count=%d zone=%q capacity=%q garage_bin=%q admin_port=%d rpc_port=%d timeout=%s admin_token=%s rpc_secret=%s", n.Name, n.Discovery, n.Endpoint, strings.Join(n.Endpoints, ","), n.ExpectedCount, n.Zone, n.Capacity, n.GarageBin, n.AdminPort, n.RPCPort, n.RequestTimeout, redactSecret(n.AdminToken), redactSecret(n.RPCSecret))
 		}
 		log.Printf("    access_keys:")
 		for _, ak := range g.AccessKeys {

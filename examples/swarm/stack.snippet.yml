@@ -1,0 +1,23 @@
+services:
+  garage-reconciler:
+    image: your-registry/garage-with-reconciler:latest
+    command: ["/garage-reconciler", "-c", "/etc/garage-reconciler.toml", "-dry-run=false"]
+    configs:
+      - source: garage_reconciler_toml
+        target: /etc/garage-reconciler.toml
+    secrets:
+      - garage_rpc_secret
+      - garage_admin_token
+      - garage_registry_access_key_id
+      - garage_registry_secret_key
+    networks:
+      - garage_net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+configs:
+  garage_reconciler_toml:
+    file: ./garage-reconciler.toml

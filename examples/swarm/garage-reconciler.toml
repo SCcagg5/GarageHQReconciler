@@ -1,0 +1,25 @@
+[[garages]]
+name = "garage-rf3"
+garage_bin = "/garage"
+admin_port = 3903
+rpc_port = 3901
+interval = "30s"
+timeout = "10s"
+replication_factor = 3
+rpc_secret_file = "/run/secrets/garage_rpc_secret"
+admin_token_file = "/run/secrets/garage_admin_token"
+replace_offline_nodes = true
+
+# Homogeneous Swarm service: tasks.garage resolves to all Garage task IPs.
+# No container names are required.
+targets = [
+  { name = "garage-dc1", discovery = "dns", endpoint = "tasks.garage", expected_count = 3, zone = "dc1", capacity = "100G" },
+]
+
+access_keys = [
+  { key = "registry", access_key_id_file = "/run/secrets/garage_registry_access_key_id", secret_key_file = "/run/secrets/garage_registry_secret_key" },
+]
+
+buckets = [
+  { name = "docker-registry", key = "registry", max_size = 0, max_objects = 0 },
+]
